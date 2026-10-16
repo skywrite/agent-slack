@@ -1,14 +1,40 @@
 import type { SlackApiClient } from "./client.ts";
 import { renderSlackMessageContent } from "./render.ts";
 
+/**
+ * Slack's views of the pile since Later split into To-dos and Saved: the
+ * Saved section of Home, the To-dos tab, and the completed and archived
+ * states. `saved.list` accepts `filter` values none, saved, todo, completed
+ * and archived; its own `saved` value means the whole in-progress pile with
+ * to-dos sorted first, not the Saved section, so that view is the default
+ * view narrowed to the items whose `todo_state` is `saved`. An item with no
+ * `todo_state` predates the split, when everything was saved for later.
+ */
+export type LaterFilter = "saved" | "todo" | "completed" | "archived";
+
+const VIEWS: Record<LaterFilter, { api: string; todoState?: string }> = {
+  saved: { api: "none", todoState: "saved" },
+  todo: { api: "todo" },
+  completed: { api: "completed" },
+  archived: { api: "archived" },
+};
+
 export type LaterItem = {
+  /** `message` for a saved or to-do'd message; `reminder` for a to-do typed by hand */
+  item_type: string;
   channel_id: string;
   channel_name?: string;
   ts: string;
+  /** Slack's id for a hand-typed to-do; messages are keyed by channel_id + ts instead */
+  item_id?: string;
   state: string;
+  /** Which pile Slack shows the item in: `saved`, `to_do` or `completed` */
+  todo_state?: string;
   date_saved: number;
   date_completed?: number;
   date_due?: number;
+  /** A hand-typed to-do's own text */
+  description?: string;
   message?: {
     author?: { user_id?: string; bot_id?: string };
     content?: string;
@@ -21,6 +47,8 @@ export async function fetchLaterItems(
   client: SlackApiClient,
   options?: {
     state?: "in_progress" | "archived" | "completed" | "all";
+    /** One of Slack's views; omitted, Slack answers with its default view */
+    filter?: LaterFilter;
     limit?: number;
     maxBodyChars?: number;
     countsOnly?: boolean;
@@ -29,7 +57,14 @@ export async function fetchLaterItems(
   },
 ): Promise<{
   counts: {
+    /** Everything not completed or archived: the Saved pile and the To-dos together */
     in_progress: number;
+    /** The Saved section of Home */
+    saved: number;
+    /** The To-dos tab */
+    todo: number;
+    /** To-dos whose reminder has passed */
+    overdue: number;
     archived: number;
     completed: number;
     total: number;
@@ -42,8 +77,14 @@ export async function fetchLaterItems(
   const maxBodyChars = options?.maxBodyChars ?? 4000;
   const countsOnly = options?.countsOnly ?? false;
   const dueBefore = options?.dueBefore;
+  const view = options?.filter === undefined ? undefined : VIEWS[options.filter];
+  const apiFilter = view?.api;
   const matches = (item: Record<string, unknown>): boolean => {
-    if (getString(item.item_type) !== "message") {
+    const itemType = getString(item.item_type);
+    if (itemType !== "message" && itemType !== "reminder") {
+      return false;
+    }
+    if (view?.todoState !== undefined && (getString(item.todo_state) ?? "saved") !== view.todoState) {
       return false;
     }
     if (stateFilter !== "all" && getString(item.state) !== stateFilter) {
@@ -65,6 +106,7 @@ export async function fetchLaterItems(
     const resp = await client.api("saved.list", {
       limit: 50,
       cursor: currentCursor,
+      ...(apiFilter === undefined ? {} : { filter: apiFilter }),
     });
 
     if (!currentCursor) {
@@ -87,9 +129,15 @@ export async function fetchLaterItems(
     currentCursor = nextCursor;
   }
 
+  // Since the split, uncompleted_count is the Saved pile alone and the To-dos have their own count.
+  const saved = getNumber(counts.uncompleted_count) ?? 0;
+  const todo = getNumber(counts.todo_count) ?? 0;
   const result = {
     counts: {
-      in_progress: getNumber(counts.uncompleted_count) ?? 0,
+      in_progress: saved + todo,
+      saved,
+      todo,
+      overdue: getNumber(counts.uncompleted_overdue_count) ?? 0,
       archived: getNumber(counts.archived_count) ?? 0,
       completed: getNumber(counts.completed_count) ?? 0,
       total: getNumber(counts.total_count) ?? 0,
@@ -107,12 +155,34 @@ export async function fetchLaterItems(
   // Hydrate items in parallel
   result.items = await Promise.all(
     filtered.map(async (item) => {
-      const channelId = getString(item.item_id) ?? "";
-      const ts = getString(item.ts) ?? "";
+      const itemType = getString(item.item_type) ?? "message";
       const state = getString(item.state) ?? "in_progress";
+      const todoState = getString(item.todo_state);
       const dateSaved = getNumber(item.date_created) ?? 0;
       const dateCompleted = getNumber(item.date_completed);
       const dateDue = getNumber(item.date_due);
+      const stamps = {
+        state,
+        todo_state: todoState,
+        date_saved: dateSaved,
+        date_completed: dateCompleted && dateCompleted > 0 ? dateCompleted : undefined,
+        date_due: dateDue && dateDue > 0 ? dateDue : undefined,
+      };
+
+      // A to-do typed by hand has no conversation behind it, only its own text.
+      if (itemType === "reminder") {
+        return {
+          item_type: "reminder",
+          channel_id: "",
+          ts: "",
+          item_id: getString(item.item_id),
+          ...stamps,
+          description: clip(renderReminderDescription(item.description), maxBodyChars) || undefined,
+        } satisfies LaterItem;
+      }
+
+      const channelId = getString(item.item_id) ?? "";
+      const ts = getString(item.ts) ?? "";
 
       let channelName: string | undefined;
       let message: LaterItem["message"];
@@ -161,11 +231,7 @@ export async function fetchLaterItems(
           const msgs = asArray(history.messages).filter(isRecord);
           const msg = msgs.find((m) => getString(m.ts) === ts);
           if (msg) {
-            const rendered = renderSlackMessageContent(msg);
-            const content =
-              maxBodyChars >= 0 && rendered.length > maxBodyChars
-                ? `${rendered.slice(0, maxBodyChars)}\n…`
-                : rendered;
+            const content = clip(renderSlackMessageContent(msg), maxBodyChars);
 
             message = {
               author:
@@ -186,13 +252,11 @@ export async function fetchLaterItems(
       }
 
       return {
+        item_type: "message",
         channel_id: channelId,
         channel_name: channelName,
         ts,
-        state,
-        date_saved: dateSaved,
-        date_completed: dateCompleted && dateCompleted > 0 ? dateCompleted : undefined,
-        date_due: dateDue && dateDue > 0 ? dateDue : undefined,
+        ...stamps,
         message,
       } satisfies LaterItem;
     }),
@@ -312,6 +376,31 @@ function getNext9am(daysFromNow: number): number {
   date.setDate(date.getDate() + daysFromNow);
   date.setHours(9, 0, 0, 0);
   return Math.floor(date.getTime() / 1000);
+}
+
+/** Cut rendered text to the body limit; -1 means unlimited. */
+function clip(text: string, maxBodyChars: number): string {
+  return maxBodyChars >= 0 && text.length > maxBodyChars ? `${text.slice(0, maxBodyChars)}\n…` : text;
+}
+
+/**
+ * A hand-typed to-do's text. Slack stores it as rich_text blocks, sometimes
+ * serialized as a JSON string; plain text is passed through.
+ */
+export function renderReminderDescription(raw: unknown): string {
+  let blocks: unknown = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith("[")) {
+      return trimmed;
+    }
+    try {
+      blocks = JSON.parse(trimmed);
+    } catch {
+      return trimmed;
+    }
+  }
+  return Array.isArray(blocks) ? renderSlackMessageContent({ blocks }) : "";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

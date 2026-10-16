@@ -1,5 +1,6 @@
 import type { Command } from "commander";
 import type { CliContext } from "./context.ts";
+import type { LaterFilter } from "../slack/later.ts";
 import {
   setLaterReminder,
   fetchLaterItems,
@@ -56,16 +57,19 @@ function resolveTargetRef(input: {
 export function registerLaterCommand(input: { program: Command; ctx: CliContext }): void {
   const laterCmd = input.program
     .command("later")
-    .description("Manage saved-for-later messages (Slack's Later tab)");
+    .description("Manage saved and to-do items (Slack's To-dos tab and the Saved section of Home, formerly Later)");
 
   laterCmd
     .command("list", { isDefault: true })
-    .description("List saved-for-later messages")
+    .description("List saved and to-do items")
     .option("--workspace <url>", "Workspace URL (defaults to your configured workspace)")
     .option(
+      "--filter <view>",
+      "One of Slack's views: saved (the Saved section), todo (the To-dos tab), completed, or archived; omit for everything in progress",
+    )
+    .option(
       "--state <state>",
-      "Filter by state: in_progress (default), archived, completed, all",
-      "in_progress",
+      "Filter by state: in_progress (the default without --filter), archived, completed, all",
     )
     .option("--limit <n>", "Max items to show (default 20)", "20")
     .option(
@@ -81,6 +85,7 @@ export function registerLaterCommand(input: { program: Command; ctx: CliContext 
     .action(
       async (options: {
         workspace?: string;
+        filter?: string;
         state?: string;
         limit?: string;
         maxBodyChars?: string;
@@ -89,7 +94,9 @@ export function registerLaterCommand(input: { program: Command; ctx: CliContext 
       }) => {
         try {
           const workspaceUrl = input.ctx.effectiveWorkspaceUrl(options.workspace);
-          const state = parseState(options.state ?? "in_progress");
+          const filter = options.filter === undefined ? undefined : parseFilter(options.filter);
+          // A view already says which states it holds; only the default view narrows to in-progress.
+          const state = parseState(options.state ?? (filter === undefined ? "in_progress" : "all"));
           const dueBefore =
             options.dueWithin === undefined ? undefined : parseReminderDuration(options.dueWithin);
 
@@ -99,6 +106,7 @@ export function registerLaterCommand(input: { program: Command; ctx: CliContext 
               const { client } = await input.ctx.getClientForWorkspace(workspaceUrl);
               return fetchLaterItems(client, {
                 state,
+                filter,
                 limit: Number.parseInt(options.limit ?? "20", 10),
                 maxBodyChars: Number.parseInt(options.maxBodyChars ?? "4000", 10),
                 countsOnly: options.countsOnly,
@@ -117,7 +125,7 @@ export function registerLaterCommand(input: { program: Command; ctx: CliContext 
 
   laterCmd
     .command("complete")
-    .description("Mark a saved message as completed")
+    .description("Mark a saved or to-do item as completed")
     .argument("<target>", "Slack message URL or channel ID")
     .option("--workspace <url>", "Workspace URL")
     .option("--ts <ts>", "Message ts (required when using channel ID)")
@@ -142,7 +150,7 @@ export function registerLaterCommand(input: { program: Command; ctx: CliContext 
 
   laterCmd
     .command("archive")
-    .description("Archive a saved message")
+    .description("Archive a saved or to-do item")
     .argument("<target>", "Slack message URL or channel ID")
     .option("--workspace <url>", "Workspace URL")
     .option("--ts <ts>", "Message ts (required when using channel ID)")
@@ -167,7 +175,7 @@ export function registerLaterCommand(input: { program: Command; ctx: CliContext 
 
   laterCmd
     .command("reopen")
-    .description("Move a saved message back to in-progress")
+    .description("Move a completed or archived item back to in-progress")
     .argument("<target>", "Slack message URL or channel ID")
     .option("--workspace <url>", "Workspace URL")
     .option("--ts <ts>", "Message ts (required when using channel ID)")
@@ -196,7 +204,7 @@ export function registerLaterCommand(input: { program: Command; ctx: CliContext 
 
   laterCmd
     .command("save")
-    .description("Save a message for later")
+    .description("Add a message to Saved")
     .argument("<target>", "Slack message URL or channel ID")
     .option("--workspace <url>", "Workspace URL")
     .option("--ts <ts>", "Message ts (required when using channel ID)")
@@ -221,7 +229,7 @@ export function registerLaterCommand(input: { program: Command; ctx: CliContext 
 
   laterCmd
     .command("remove")
-    .description("Remove a message from Later entirely")
+    .description("Remove a message from Saved and To-dos entirely")
     .argument("<target>", "Slack message URL or channel ID")
     .option("--workspace <url>", "Workspace URL")
     .option("--ts <ts>", "Message ts (required when using channel ID)")
@@ -246,7 +254,7 @@ export function registerLaterCommand(input: { program: Command; ctx: CliContext 
 
   laterCmd
     .command("remind")
-    .description("Set a reminder for a saved message")
+    .description("Set a reminder (due date) on a saved or to-do item")
     .argument("<target>", "Slack message URL or channel ID")
     .requiredOption(
       "--in <duration>",
@@ -283,6 +291,23 @@ export function registerLaterCommand(input: { program: Command; ctx: CliContext 
         process.exitCode = 1;
       }
     });
+}
+
+export function parseFilter(value: string): LaterFilter {
+  const v = value.toLowerCase().trim();
+  if (v === "saved") {
+    return "saved";
+  }
+  if (v === "todo" || v === "todos" || v === "to-do" || v === "to_do") {
+    return "todo";
+  }
+  if (v === "completed" || v === "complete" || v === "done") {
+    return "completed";
+  }
+  if (v === "archived" || v === "archive") {
+    return "archived";
+  }
+  throw new Error(`Invalid --filter: "${value}". Use: saved, todo, completed, or archived.`);
 }
 
 function parseState(value: string): "in_progress" | "archived" | "completed" | "all" {

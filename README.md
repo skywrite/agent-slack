@@ -529,7 +529,7 @@ Note: This feature uses the `client.counts` API which may be restricted in some 
 
 ### Later (saved messages)
 
-Manage your saved-for-later messages (Slack's Later tab):
+Manage your saved and to-do items (Slack's To-dos tab and the Saved section of Home, formerly Later):
 
 ```bash
 # List saved messages (in-progress by default)
@@ -543,6 +543,10 @@ agent-slack later list --state completed
 
 # Only items whose reminder is overdue or due within the next 12 hours
 agent-slack later list --due-within 12h
+
+# One of Slack's views: the To-dos tab, or the Saved section of Home
+agent-slack later list --filter todo
+agent-slack later list --filter saved
 
 # Save a message for later
 agent-slack later save "https://workspace.slack.com/archives/C123/p1700000000000000"

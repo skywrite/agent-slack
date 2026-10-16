@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   fetchLaterItems,
+  renderReminderDescription,
   updateLaterMark,
   saveLater,
   removeLater,
@@ -8,6 +9,7 @@ import {
   parseReminderDuration,
 } from "../src/slack/later.ts";
 import type { SlackApiClient } from "../src/slack/client.ts";
+import { parseFilter } from "../src/cli/later-command.ts";
 
 function createClient(responses: Record<string, Record<string, unknown>>) {
   const calls: { method: string; params: Record<string, unknown>; multipart?: boolean }[] = [];
@@ -53,6 +55,9 @@ describe("fetchLaterItems", () => {
     expect(calls[0]?.method).toBe("saved.list");
     expect(result.counts).toEqual({
       in_progress: 5,
+      saved: 5,
+      todo: 0,
+      overdue: 0,
       archived: 1,
       completed: 10,
       total: 16,
@@ -60,7 +65,7 @@ describe("fetchLaterItems", () => {
     expect(result.items).toHaveLength(0);
   });
 
-  test("filters to message items only", async () => {
+  test("keeps messages and hand-typed to-dos, drops other item types", async () => {
     const { client } = createClient({
       "saved.list": {
         ok: true,
@@ -79,8 +84,14 @@ describe("fetchLaterItems", () => {
             state: "in_progress",
             date_created: 200,
           },
+          {
+            item_id: "F123",
+            item_type: "file",
+            state: "in_progress",
+            date_created: 300,
+          },
         ],
-        counts: { uncompleted_count: 2, archived_count: 0, completed_count: 0, total_count: 2 },
+        counts: { uncompleted_count: 3, archived_count: 0, completed_count: 0, total_count: 3 },
       },
       "conversations.info": { ok: true, channel: { name: "general" } },
       "conversations.history": {
@@ -91,8 +102,10 @@ describe("fetchLaterItems", () => {
 
     const result = await fetchLaterItems(client);
 
-    expect(result.items).toHaveLength(1);
-    expect(result.items[0]?.channel_id).toBe("C123");
+    expect(result.items.map((item) => [item.item_type, item.item_id ?? item.channel_id])).toEqual([
+      ["reminder", "Sa123"],
+      ["message", "C123"],
+    ]);
   });
 
   test("filters by state", async () => {
@@ -540,5 +553,176 @@ describe("parseReminderDuration", () => {
     expect(() => parseReminderDuration("banana")).toThrow("Invalid duration");
     expect(() => parseReminderDuration("")).toThrow("Invalid duration");
     expect(() => parseReminderDuration("abc123")).toThrow("Invalid duration");
+  });
+});
+
+describe("fetchLaterItems views and to-dos", () => {
+  const counts = { uncompleted_count: 1, archived_count: 0, completed_count: 0, total_count: 1 };
+  const message = {
+    item_id: "C1",
+    item_type: "message",
+    ts: "1.1",
+    state: "in_progress",
+    todo_state: "to_do",
+    date_created: 100,
+    date_due: 500,
+  };
+
+  test("asks Slack for one of its views and surfaces todo_state", async () => {
+    const { client, calls } = createClient({
+      "saved.list": { ok: true, saved_items: [message], counts },
+      "conversations.info": { ok: true, channel: { name: "atlas" } },
+      "conversations.history": { ok: true, messages: [] },
+    });
+
+    const result = await fetchLaterItems(client, { filter: "todo" });
+
+    expect(calls[0]?.params.filter).toBe("todo");
+    expect(result.items[0]?.item_type).toBe("message");
+    expect(result.items[0]?.todo_state).toBe("to_do");
+    expect(result.items[0]?.date_due).toBe(500);
+  });
+
+  test("sends no filter by default", async () => {
+    const plain = createClient({ "saved.list": { ok: true, saved_items: [], counts } });
+    await fetchLaterItems(plain.client);
+    expect("filter" in (plain.calls[0]?.params ?? {})).toBe(false);
+  });
+
+  test("the Saved section is the default view narrowed to todo_state saved", async () => {
+    const { client, calls } = createClient({
+      "saved.list": {
+        ok: true,
+        saved_items: [
+          message,
+          { ...message, item_id: "C2", ts: "2.2", todo_state: "saved", date_due: 0 },
+          { item_id: "C3", item_type: "message", ts: "3.3", state: "in_progress", date_created: 300 },
+        ],
+        counts,
+      },
+      "conversations.info": { ok: true, channel: { name: "atlas" } },
+      "conversations.history": { ok: true, messages: [] },
+    });
+
+    const result = await fetchLaterItems(client, { filter: "saved" });
+
+    expect(calls[0]?.params.filter).toBe("none");
+    expect(result.items.map((item) => item.channel_id)).toEqual(["C2", "C3"]);
+  });
+
+  test("splits the counts into the Saved pile and the To-dos when Slack reports both", async () => {
+    const { client } = createClient({
+      "saved.list": {
+        ok: true,
+        saved_items: [],
+        counts: {
+          uncompleted_count: 69,
+          uncompleted_overdue_count: 2,
+          todo_count: 93,
+          archived_count: 0,
+          completed_count: 3691,
+          total_count: 3853,
+        },
+      },
+    });
+    const result = await fetchLaterItems(client, { countsOnly: true });
+    expect(result.counts).toEqual({
+      in_progress: 162,
+      saved: 69,
+      todo: 93,
+      overdue: 2,
+      archived: 0,
+      completed: 3691,
+      total: 3853,
+    });
+  });
+
+  test("renders a hand-typed to-do from its own text without fetching a conversation", async () => {
+    const { client, calls } = createClient({
+      "saved.list": {
+        ok: true,
+        saved_items: [
+          {
+            item_id: "Rm1",
+            item_type: "reminder",
+            state: "in_progress",
+            todo_state: "to_do",
+            date_created: 100,
+            date_due: 900,
+            description: [
+              {
+                type: "rich_text",
+                elements: [
+                  { type: "rich_text_section", elements: [{ type: "text", text: "Send the board deck" }] },
+                ],
+              },
+            ],
+          },
+        ],
+        counts,
+      },
+    });
+
+    const result = await fetchLaterItems(client, { filter: "todo" });
+
+    expect(calls.map((c) => c.method)).toEqual(["saved.list"]);
+    expect(result.items).toEqual([
+      {
+        item_type: "reminder",
+        channel_id: "",
+        ts: "",
+        item_id: "Rm1",
+        state: "in_progress",
+        todo_state: "to_do",
+        date_saved: 100,
+        date_completed: undefined,
+        date_due: 900,
+        description: "Send the board deck",
+      },
+    ]);
+  });
+
+  test("still leaves file items out", async () => {
+    const { client } = createClient({
+      "saved.list": {
+        ok: true,
+        saved_items: [{ item_id: "F1", item_type: "file", state: "in_progress", date_created: 1 }],
+        counts,
+      },
+    });
+    const result = await fetchLaterItems(client, { state: "all" });
+    expect(result.items).toHaveLength(0);
+  });
+});
+
+describe("renderReminderDescription", () => {
+  const blocks = [
+    { type: "rich_text", elements: [{ type: "rich_text_section", elements: [{ type: "text", text: "Call Sam" }] }] },
+  ];
+
+  test("renders blocks given as an array or as a JSON string", () => {
+    expect(renderReminderDescription(blocks)).toBe("Call Sam");
+    expect(renderReminderDescription(JSON.stringify(blocks))).toBe("Call Sam");
+  });
+
+  test("passes plain text through and gives nothing for other shapes", () => {
+    expect(renderReminderDescription("  Call Sam ")).toBe("Call Sam");
+    expect(renderReminderDescription({ text: "x" })).toBe("");
+    expect(renderReminderDescription(undefined)).toBe("");
+  });
+});
+
+describe("parseFilter", () => {
+  test("accepts Slack's view names and the spellings people type", () => {
+    expect(parseFilter("todo")).toBe("todo");
+    expect(parseFilter("to-dos".replace("s", ""))).toBe("todo");
+    expect(parseFilter("Saved")).toBe("saved");
+    expect(parseFilter("done")).toBe("completed");
+    expect(parseFilter("archive")).toBe("archived");
+  });
+
+  test("refuses an unknown view with the list of valid ones", () => {
+    expect(() => parseFilter("later")).toThrow(/saved, todo, completed, or archived/);
+    expect(() => parseFilter("overdue")).toThrow();
   });
 });

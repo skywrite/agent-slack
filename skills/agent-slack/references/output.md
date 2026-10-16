@@ -12,7 +12,7 @@ Immediate non-attachment sends return `ts` and usually a `permalink`. Attachment
 `canvas create` returns `canvas: { id, title?, channel_id? }`. `canvas get` returns `canvas: { id, title?, markdown }`.
 `canvas edit` returns `ok: true` and `canvas: { id, operation }` after Slack accepts the change.
 
-`later list` items carry Unix-second `date_saved`, plus `date_completed` and `date_due` when set. `date_due` is the item's reminder; `--due-within` keeps only items with one at or before the given time, overdue included.
+`later list` items carry Unix-second `date_saved`, plus `date_completed` and `date_due` when set. `date_due` is the item's reminder; `--due-within` keeps only items with one at or before the given time, overdue included. `item_type` is `message` (keyed by `channel_id` + `ts`) or `reminder` (a to-do typed by hand, keyed by `item_id`, its text in `description`). `todo_state` says which pile Slack shows an item in: `saved`, `to_do` or `completed`. `--filter saved|todo|completed|archived` lists one of Slack's views, the Saved section of Home or the To-dos tab among them; without it Slack answers with everything in progress and `--state` narrows to in-progress items. `counts` reports `saved` (the Saved section), `todo` (the To-dos tab), `overdue` (to-dos whose reminder passed) and `in_progress` (both piles together).
 
 Message payloads keep canonical user IDs. Pass `--resolve-users` to add display metadata under `referenced_users`, or `--refresh-users` to refresh the 24-hour per-workspace cache before resolving.
 
